@@ -4,7 +4,7 @@ TorchKart is a modern implementation of a Proximal Policy Optimization Agent lea
 
 ![20 Clients Learning](docs/cover.png)
 
-There are a few components to the project:
+## Components
 
 ### `mk64_interface.lua`
 
@@ -26,6 +26,10 @@ resetting the environment, and stepping.
 ### `torchkart.py/ActorCritic`
 
 This is the main PPO implementation, implementing the dual Actor/Critic networks used, as well as getters. 
+
+## Results
+
+[View the results here](docs/torchkart.pdf).
 
 ## Installation
 

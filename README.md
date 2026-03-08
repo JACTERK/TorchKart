@@ -43,8 +43,7 @@ supported by this program.
 
 - Create a new folder called `bizhawk` that will be used to store the required files for the BizHawk emulator. 
 - Decompress the contents of `BizHawk-2.11-win-x64.zip` into the `bizhawk` folder. 
-- Copy the contents of the `Lua` folder into the `bizhawk/Lua` folder. This will provide the necessary files needed for 
-the socket implementation. 
+- Copy the contents of the `Lua` folder into the `bizhawk/Lua` folder. Click yes if it asks to replace any files. 
 - Open the `launch_training.ps1` script, and change the `$RomPath` to the absolute path of your ROM file. 
 
 ### Create a Save State

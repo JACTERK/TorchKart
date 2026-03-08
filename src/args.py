@@ -9,7 +9,7 @@ def parse_args():
                         help="Number of parallel BizHawk clients to connect to.")
     parser.add_argument("--host", type=str, default="127.0.0.1",
                         help="Host IP address to bind the server to.")
-    parser.add_argument("--port", type=int, default=65432,
+    parser.add_argument("--port", type=int, default=54321,
                         help="Port to listen on.")
 
     # PPO Hyperparameters

@@ -1,0 +1,5 @@
+bizhawk/
+rom/
+runs/
+*.state
+src/__pycache__

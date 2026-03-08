@@ -1,6 +1,6 @@
 param (
     # Default to 1 environment if not specified
-    [int]$NumEnvs = 20
+    [int]$NumEnvs = 4
 )
 
 # --- Configuration ---

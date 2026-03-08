@@ -6,8 +6,8 @@ local socket = require("socket")
 
 -- --- Configuration ---
 local HOST = "127.0.0.1"
-local PORT = 65432
-local SAVESTATE_PATH = "C:/Users/jacobterkuc/Documents/Github/project-group-94/mk64_start.state"
+local PORT = 54321
+local SAVESTATE_PATH = "C:/Users/jacobterkuc/Documents/Github/TorchKart/mk64_start.state"
 local MEMORY_DOMAIN = "RDRAM"
 
 -- {address (hex), num_bytes}

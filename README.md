@@ -68,20 +68,28 @@ Tensorboard will be accessible on localhost at `http://localhost:6006`.
 
 ## Start Training
 
-To run the app, start the `torchkart.py` script with:
+Training uses two terminals — one for managing emulators, one for the training script.
+
+### Terminal 1 — Launch Emulators
 
 ```
-python torchkart.py --num_envs=20 --total_timesteps=250000000 save_interval=60
+python launch_emulators.py --rom-path="path/to/marioKart.n64" --num-envs=20
 ```
 
-This will run the script waiting for 20 BizHawk clients, and will run for 250M steps, saving every 60 updates. 
+The emulators will open and arrange in a grid layout on the left side of your screen. You can control the 
+layout with `--grid-cols` (default 5) and `--grid-fraction` (default 0.33, fraction of screen width to use).
 
-Next, to start the BizHawk Clients, run `./launch_training.ps1 -NumEnvs=20`. 
+Type `exit` (or press `Ctrl+C`) to close all emulators.
 
-Watch the python terminal for the 20 successful connections, and upon the 20 connections the training will begin
-immediately. 
+### Terminal 2 — Start Training
+
+```
+python main.py --num-envs=20 --total-timesteps=250000000 --save-interval=60
+```
+
+The training script will wait for all BizHawk clients to connect, then begin training automatically.
 
 ### Loading a Checkpoint
 
-To run the app from a checkpoint, add the `--load_checkpoint` flag and set it to the absolute path of a `.pth` file you
-want to load. These files are automatically saved in the `runs` folder. 
+To resume from a checkpoint, add the `--load-checkpoint` flag and set it to the absolute path of a `.pth` file you
+want to load. These files are automatically saved in the `runs` folder.

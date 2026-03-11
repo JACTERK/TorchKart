@@ -22,18 +22,24 @@ local MEMORY_MAP = {
     {0x0F6BE4, 4}, -- wall_2 -- Fixed-Point 16.16 (Changes by very small number)
     {0x163068, 4}, -- Distance from the center of the track (0 is centered, negative is how far left, positive is how far right, road is between -1 and 1) -- Float
     {0x18CFE4, 4}, -- speed -- float
+    {0x0F69A0, 4}, -- mushroom count -- Fixed-Point 16.16 (14=3, 13=2, 12=1, 0=0)
 }
 
--- Define discrete actions
--- 0: Forward
--- 1: Forward + Left
--- 2: Forward + Right
--- 3: Drift Left
--- 4: Drift Right
--- 5: Turn Left (no gas)
--- 6: Turn Right (no gas)
--- 7: No action
-local function execute_action(action_id)
+-- Steering analog values for each steering index (0-4)
+local STEERING_VALUES = {
+    [0] = -80,  -- Hard Left
+    [1] = -40,  -- Slight Left
+    [2] = 0,    -- Center
+    [3] = 40,   -- Slight Right
+    [4] = 80,   -- Hard Right
+}
+
+-- Multi-head action execution
+-- throttle: 0=nothing, 1=forward(A), 2=brake(B)
+-- steering: 0=hard left, 1=slight left, 2=center, 3=slight right, 4=hard right
+-- drift:    0=no drift, 1=drift(R)
+-- item:     0=no item, 1=use item(Z)
+local function execute_multi_action(throttle, steering, drift, item)
     -- Table for digital buttons
     local digital_controls = {
         A = false,
@@ -48,45 +54,27 @@ local function execute_action(action_id)
         ["Y Axis"] = 0.0
     }
 
-    if action_id == 0 then      -- Forward
+    -- Throttle
+    if throttle == 1 then       -- Forward
         digital_controls.A = true
-        analog_controls["Y Axis"] = 80 -- Stick "up"
-        
-    elseif action_id == 1 then -- Forward + Left
-        digital_controls.A = true
-        analog_controls["Y Axis"] = 80 -- Stick "up"
-        analog_controls["X Axis"] = -80 -- Stick "left"
-        
-    elseif action_id == 2 then -- Forward + Right
-        digital_controls.A = true
-        analog_controls["Y Axis"] = 80 -- Stick "up"
-        analog_controls["X Axis"] = 80 -- Stick "right"
-
-    elseif action_id == 3 then  -- Drift Left (A + R + Left)
-        digital_controls.A = true
-        digital_controls.R = true
-        analog_controls["Y Axis"] = 80
-        analog_controls["X Axis"] = -80
-
-    elseif action_id == 4 then  -- Drift Right (A + R + Right)
-        digital_controls.A = true
-        digital_controls.R = true
-        analog_controls["Y Axis"] = 80
-        analog_controls["X Axis"] = 80
-
-    elseif action_id == 5 then  -- Hard Turn Left (no gas)
-        analog_controls["X Axis"] = -80
-
-    elseif action_id == 6 then  -- Hard Turn Right (no gas)
-        analog_controls["X Axis"] = 80
-
-    elseif action_id == 7 then  -- Boost
-        digital_controls.Z = true
-
-    elseif action_id == 8 then
-        -- Do nothing...
+        analog_controls["Y Axis"] = 80  -- Stick "up"
+    elseif throttle == 2 then   -- Brake
+        digital_controls.B = true
     end
-    
+
+    -- Steering
+    analog_controls["X Axis"] = STEERING_VALUES[steering] or 0
+
+    -- Drift
+    if drift == 1 then
+        digital_controls.R = true
+    end
+
+    -- Item
+    if item == 1 then
+        digital_controls.Z = true
+    end
+
     -- Send digital inputs to Player 1
     joypad.set(digital_controls, 1)
     
@@ -161,18 +149,26 @@ while true do
 
     elseif command_char == "S" then
         -- Step command
-        -- Receive the action ID (1 byte)
-        local action_status, action_char = pcall(client.receive, client, 1)
+        -- Receive 5 bytes: 1 byte frame_skip + 4 bytes action (throttle, steering, drift, item)
+        local action_status, action_data = pcall(client.receive, client, 5)
 
         if not action_status then
-            console.log("Connection error (receiving action): " .. tostring(action_char))
+            console.log("Connection error (receiving action): " .. tostring(action_data))
             client:close()
             break
         end
 
-        local action_id = string.byte(action_char)
-        execute_action(action_id)
-        emu.frameadvance()
+        local frame_skip = string.byte(action_data, 1)
+        local throttle   = string.byte(action_data, 2)
+        local steering   = string.byte(action_data, 3)
+        local drift      = string.byte(action_data, 4)
+        local item_use   = string.byte(action_data, 5)
+
+        -- Execute the action for frame_skip frames
+        for f = 1, frame_skip do
+            execute_multi_action(throttle, steering, drift, item_use)
+            emu.frameadvance()
+        end
 
         local state_bytes = get_state_bytes()
         pcall(client.send, client, state_bytes)

@@ -36,7 +36,7 @@ def main():
 
     # --- Setup Environment ---
     # Pause the script and wait for num_envs clients to connect
-    envs = MK64Env(num_envs=args.num_envs, host=args.host, port=args.port)
+    envs = MK64Env(num_envs=args.num_envs, host=args.host, port=args.port, frame_skip=args.frame_skip)
 
     # --- Setup Agent ---
     agent = ActorCritic(envs).to(device)
@@ -45,11 +45,14 @@ def main():
     # --- Setup Storage ---
     # This buffer will store the rollouts
     obs = torch.zeros((args.num_steps, args.num_envs) + envs._single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs._single_action_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs, len(envs.ACTION_DIMS))).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+
+    # Counters for per-update aggregate metrics
+    head_names = ["throttle", "steering", "drift", "item"]
 
     # --- Start Training ---
     global_step = 0
@@ -85,6 +88,12 @@ def main():
 
             print(f"\n--- Update {update}/{num_updates} ---")
 
+            # Linear LR annealing: decay from initial LR to 0 over training
+            frac = 1.0 - (update - 1) / num_updates
+            lr_now = frac * args.learning_rate
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_now
+
             # --- Collect Rollouts ---
             pbar = tqdm(range(0, args.num_steps), desc="Collecting Rollout")
             for step in pbar:
@@ -95,7 +104,7 @@ def main():
 
                 # Get action from the agent
                 with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    action, logprob, _, value, _ = agent.get_action_and_value(next_obs)
                     values[step] = value.flatten()
 
                 actions[step] = action
@@ -127,6 +136,12 @@ def main():
                         writer.add_scalar("charts/episodic_length", ep_len, global_step)
                         writer.add_scalar("charts/final_lap", ep_final_lap, global_step)
 
+                        # Game performance metrics
+                        writer.add_scalar("charts/avg_speed", ep_info.get("avg_speed", 0), global_step)
+                        writer.add_scalar("charts/wall_hits_per_episode", ep_info.get("wall_hits", 0), global_step)
+                        writer.add_scalar("charts/avg_progress_per_step", ep_info.get("avg_progress_per_step", 0), global_step)
+                        writer.add_scalar("charts/stuck_termination", float(ep_info.get("stuck_termination", False)), global_step)
+
                         if "race_time" in ep_info:
                             race_time = ep_info["race_time"]
                             print(f"  [Env {i}] *** RACE COMPLETED *** Time: {race_time:.2f}s")
@@ -155,7 +170,7 @@ def main():
             # Flatten the batch
             b_obs = obs.reshape((-1,) + envs._single_observation_space.shape)
             b_logprobs = logprobs.reshape(-1)
-            b_actions = actions.reshape((-1,) + envs._single_action_space.shape)
+            b_actions = actions.reshape((-1, len(envs.ACTION_DIMS)))
             b_advantages = advantages.reshape(-1)
             b_returns = returns.reshape(-1)
             b_values = values.reshape(-1)
@@ -171,7 +186,7 @@ def main():
                     mb_inds = b_inds[start:end]
 
                     # Evaluate the moves made by the 'old' network against the 'new' one
-                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    _, newlogprob, entropy, newvalue, head_ents = agent.get_action_and_value(
                         b_obs[mb_inds], b_actions.long()[mb_inds]
                     )
 
@@ -181,6 +196,8 @@ def main():
 
                     with torch.no_grad():
                         approx_kl = ((ratio - 1) - logratio).mean()
+                        # Track clip fraction
+                        clipfracs = ((ratio - 1.0).abs() > args.clip_coef).float().mean()
 
                     mb_advantages = b_advantages[mb_inds]
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
@@ -205,23 +222,51 @@ def main():
                     # Entropy loss (Exploration)
                     entropy_loss = entropy.mean()
 
+                    # Per-head entropy (for logging, taken from last minibatch)
+                    last_head_entropies = head_ents.mean(dim=0)
+
                     # Total loss
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    # Capture grad norm before clipping
+                    grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                     optimizer.step()
 
             # --- Log Metrics ---
             sps = int(global_step / (time.time() - start_time))
             print(f"  SPS: {sps}")
+
+            # Existing metrics
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("charts/SPS", sps, global_step)
+
+            # Loss metrics
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
             writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
             writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-            writer.add_scalar("charts/SPS", sps, global_step)
+
+            # Policy health metrics
+            writer.add_scalar("losses/clipfrac", clipfracs.item(), global_step)
+            writer.add_scalar("charts/grad_norm", grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm, global_step)
+
+            # Explained variance: how well the critic predicts returns
+            # 1.0 = perfect prediction, 0 = no better than mean, negative = worse than mean
+            y_pred = b_values.cpu().numpy()
+            y_true = b_returns.cpu().numpy()
+            var_y = np.var(y_true)
+            explained_var = 1 - np.var(y_true - y_pred) / (var_y + 1e-8) if var_y > 0 else 0.0
+            writer.add_scalar("losses/explained_variance", explained_var, global_step)
+
+            # Per-head entropy
+            for h, name in enumerate(head_names):
+                writer.add_scalar(f"entropy/{name}", last_head_entropies[h].item(), global_step)
+
+            # --- LSTM metrics (uncomment when LSTM is implemented) ---
+            # writer.add_scalar("charts/hidden_state_norm", hidden_state.norm().item(), global_step)
+            # writer.add_histogram("charts/episode_length_histogram", episode_lengths_buffer, global_step)
 
             if update % args.save_interval == 0:
                 checkpoint_path = f"{run_dir}/checkpoint_update_{update}.pth"

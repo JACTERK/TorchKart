@@ -4,7 +4,7 @@ from typing import Tuple, Dict, Any, Optional
 
 import gymnasium as gym
 import numpy as np
-from gymnasium.spaces import Box, Discrete
+from gymnasium.spaces import Box, MultiDiscrete
 
 
 class MK64Env(gym.vector.VectorEnv):
@@ -13,16 +13,16 @@ class MK64Env(gym.vector.VectorEnv):
     and manages multiple BizHawk socket clients.
     """
     # Total bytes to read, based on the Lua script's MEMORY_MAP
-    # 5 * 4 (float) + 4 * 4 (int) + 1 * 2 (short uint) = 38
-    STATE_SIZE_BYTES = 38
+    # 5 * 4 (float) + 5 * 4 (int) + 1 * 2 (short uint) = 42
+    STATE_SIZE_BYTES = 42
 
-    # The struct format string for parsing the 46 bytes.
+    # The struct format string for parsing the 42 bytes.
     # '>' means big-endian (which N64 is)
     # f = 4-byte float
     # i = 4-byte signed int
     # H = 2-byte unsigned short
     # Fixed-Point 16.16 is read as 'i' (signed int)
-    STATE_FORMAT = ">fffiiHiiff"
+    STATE_FORMAT = ">fffiiHiiffi"
 
     # The names for each raw value read from the struct
     STATE_NAMES = [
@@ -35,15 +35,21 @@ class MK64Env(gym.vector.VectorEnv):
         "wall_1",
         "wall_2",
         "track_center_dist",
-        "speed"
+        "speed",
+        "mushroom_raw"
     ]
 
     # The number of processed features sent to the network (some are combined)
-    NUM_OBS_FEATURES = 9
+    NUM_OBS_FEATURES = 10
 
-    def __init__(self, num_envs, host, port, stack_size=8):
+    # Action dimensions: [throttle, steering, drift, item]
+    ACTION_DIMS = [3, 5, 2, 2]
+    NUM_ACTION_BYTES = len(ACTION_DIMS)  # 4 bytes sent to Lua
+
+    def __init__(self, num_envs, host, port, frame_skip=4, stack_size=8):
         # Define how many frames to "stack" for temporal awareness
         self.stack_size = stack_size
+        self.frame_skip = frame_skip
 
         # Observation dimensionality (Number of features * the stack size)
         obs_dim = self.NUM_OBS_FEATURES * self.stack_size
@@ -51,8 +57,8 @@ class MK64Env(gym.vector.VectorEnv):
         # Define the observation and action spaces for Gymnasium
         single_observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        # What discrete actions can the agent do (Defined in LUA)
-        single_action_space = Discrete(9)
+        # Multi-discrete action space: [throttle(3), steering(5), drift(2), item(2)]
+        single_action_space = MultiDiscrete(self.ACTION_DIMS)
 
         # Call the base object's __init__
         super().__init__()
@@ -89,6 +95,11 @@ class MK64Env(gym.vector.VectorEnv):
         self.last_state_dicts = [{} for _ in range(num_envs)]
         self.episode_rewards = np.zeros(num_envs, dtype=np.float32)
         self.episode_lengths = np.zeros(num_envs, dtype=np.int32)
+
+        # Per-episode metric trackers
+        self.episode_speed_sum = np.zeros(num_envs, dtype=np.float32)
+        self.episode_wall_hits = np.zeros(num_envs, dtype=np.int32)
+        self.episode_progress_start = np.zeros(num_envs, dtype=np.float32)
 
 
     # Getter for getting stacked observations
@@ -143,6 +154,19 @@ class MK64Env(gym.vector.VectorEnv):
             if state["wall_1"] != old_w1 or state["wall_2"] != old_w2:
                 wall_hit = 1.0
 
+        # --- Mushroom Count ---
+        # Fixed-point 16.16: raw value 14=3, 13=2, 12=1, 0=0
+        mushroom_raw = state["mushroom_raw"] >> 16  # Get integer part of fixed-point
+        if mushroom_raw >= 14:
+            mushroom_count = 3
+        elif mushroom_raw >= 13:
+            mushroom_count = 2
+        elif mushroom_raw >= 12:
+            mushroom_count = 1
+        else:
+            mushroom_count = 0
+        norm_mushrooms = mushroom_count / 3.0  # Normalize to 0.0 - 1.0
+
         # --- Build Observation Vector ---
         obs = np.array([
             norm_x_vel,
@@ -153,7 +177,8 @@ class MK64Env(gym.vector.VectorEnv):
             norm_center,
             wall_hit,
             norm_progress,
-            norm_lap
+            norm_lap,
+            norm_mushrooms
         ], dtype=np.float32)
 
         # Return processed state dict for reward calculation later
@@ -164,7 +189,8 @@ class MK64Env(gym.vector.VectorEnv):
             "track_center_dist": state["track_center_dist"],
             "wall_hit": wall_hit,  # Boolean 0.0 or 1.0
             "raw_wall_1": state["wall_1"],
-            "raw_wall_2": state["wall_2"]
+            "raw_wall_2": state["wall_2"],
+            "mushrooms": mushroom_count
         }
 
         return obs, processed_state_dict
@@ -246,6 +272,9 @@ class MK64Env(gym.vector.VectorEnv):
             self.episode_rewards[index] = 0.0
             self.episode_lengths[index] = 0
             self.stuck_counter[index] = 0
+            self.episode_speed_sum[index] = 0.0
+            self.episode_wall_hits[index] = 0
+            self.episode_progress_start[index] = state_dict.get("progress", 0.0)
 
             return stacked_obs, {}
 
@@ -277,9 +306,10 @@ class MK64Env(gym.vector.VectorEnv):
 
         try:
             # Send action command to all clients
-            for i, action_id in enumerate(s_actions):
-                # Send 'S' (Step) command + 1-byte action
-                cmd = b'S' + bytes([action_id])
+            for i in range(self.num_envs):
+                # Send 'S' (Step) command + 1-byte frame_skip + 4-byte multi-action
+                action_bytes = bytes(s_actions[i].astype(np.uint8).tolist())
+                cmd = b'S' + bytes([self.frame_skip]) + action_bytes
                 self.clients[i].sendall(cmd)
 
             # Receive new state from all clients
@@ -332,6 +362,9 @@ class MK64Env(gym.vector.VectorEnv):
                 self.last_state_dicts[i] = new_state
                 self.episode_rewards[i] += reward
                 self.episode_lengths[i] += 1
+                self.episode_speed_sum[i] += new_state.get("speed", 0.0)
+                if new_state.get("wall_hit", 0.0) > 0.5:
+                    self.episode_wall_hits[i] += 1
 
                 # Handle "done" state (terminated or truncated)
                 info = {}
@@ -342,12 +375,16 @@ class MK64Env(gym.vector.VectorEnv):
                         "episode": {
                             "r": self.episode_rewards[i],
                             "l": ep_len,
-                            "final_lap": new_state.get("lap", -99)
+                            "final_lap": new_state.get("lap", -99),
+                            "avg_speed": self.episode_speed_sum[i] / max(ep_len, 1),
+                            "wall_hits": int(self.episode_wall_hits[i]),
+                            "avg_progress_per_step": (new_state.get("progress", 0) - self.episode_progress_start[i]) / max(ep_len, 1),
+                            "stuck_termination": not is_finished_race and terminated,
                         }
                     }
                     if is_finished_race:
-                        # Assuming 60 steps/sec based on stuck counter
-                        race_time_seconds = ep_len / 60.0
+                        # Account for frame_skip: each step = frame_skip game frames
+                        race_time_seconds = (ep_len * self.frame_skip) / 60.0
                         info["final_info"]["episode"]["race_time"] = race_time_seconds
 
                     # Auto-reset this environment

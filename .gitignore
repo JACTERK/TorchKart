@@ -3,3 +3,4 @@ rom/
 runs/
 *.state
 src/__pycache__
+*.wch

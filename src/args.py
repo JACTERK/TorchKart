@@ -11,6 +11,8 @@ def parse_args():
                         help="Host IP address to bind the server to.")
     parser.add_argument("--port", type=int, default=54321,
                         help="Port to listen on.")
+    parser.add_argument("--frame-skip", type=int, default=4,
+                        help="Number of frames to repeat each action (reduces network traffic).")
 
     # PPO Hyperparameters
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,

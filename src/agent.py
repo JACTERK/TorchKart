@@ -15,52 +15,78 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class ActorCritic(nn.Module):
     """
-    The PPO Actor-Critic network.
-    It shares a common "body" and has two "heads":
-    1. The Actor (policy), which outputs action probabilities.
+    The PPO Actor-Critic network with a multi-head (factored) action space.
+    It shares a common "body" and has multiple "heads":
+    1. The Actor heads (policy), one per action dimension (throttle, steering, drift, item).
     2. The Critic (value), which estimates the state's value.
     """
 
     def __init__(self, envs):
         super().__init__()
         obs_shape = envs._single_observation_space.shape
-        num_actions = envs._single_action_space.n
 
-        # The "body" of the network
-        self.critic = nn.Sequential(
+        # Get the sizes of each action dimension from MultiDiscrete
+        # e.g., [3, 5, 2, 2] for [throttle, steering, drift, item]
+        self.action_nvec = envs._single_action_space.nvec
+
+        # The "body" of the network (shared feature extractor)
+        self.network = nn.Sequential(
             layer_init(nn.Linear(np.array(obs_shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            # The "head" for the Critic (value)
+        )
+
+        # The Critic head (value function)
+        self.critic_head = nn.Sequential(
             layer_init(nn.Linear(64, 1), std=1.0),
         )
 
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(obs_shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            # The "head" for the Actor (policy)
-            layer_init(nn.Linear(64, num_actions), std=0.01),
-        )
+        # One Actor head per action dimension
+        self.actor_heads = nn.ModuleList([
+            layer_init(nn.Linear(64, n), std=0.01)
+            for n in self.action_nvec
+        ])
 
     def get_value(self, x):
         """
         Gets the estimated value of a state.
         """
-        return self.critic(x)
+        return self.critic_head(self.network(x))
 
     def get_action_and_value(self, x, action=None):
         """
         Gets an action (and its log-probability) and the state value.
         If an action is provided, it also returns the log-prob and entropy
         of that action (used during training).
+
+        Returns:
+            action: Tensor of shape (batch, num_heads) — one index per head
+            log_prob: Tensor of shape (batch,) — sum of log-probs across heads
+            entropy: Tensor of shape (batch,) — sum of entropies across heads
+            value: Tensor of shape (batch, 1) — the estimated state value
+            head_entropies: Tensor of shape (batch, num_heads) — entropy per head (for logging)
         """
-        logits = self.actor(x)
-        probs = Categorical(logits=logits)
+        hidden = self.network(x)
+
+        # Build a Categorical distribution for each head
+        multi_logits = [head(hidden) for head in self.actor_heads]
+        multi_dists = [Categorical(logits=logits) for logits in multi_logits]
 
         if action is None:
-            action = probs.sample()
+            # Sample from each head independently
+            action = torch.stack([d.sample() for d in multi_dists], dim=-1)
 
-        return action, probs.log_prob(action), probs.entropy(), self.get_value(x)
+        # Compute log-prob and entropy per-head, then sum
+        log_prob = torch.stack(
+            [d.log_prob(action[:, i]) for i, d in enumerate(multi_dists)], dim=-1
+        ).sum(dim=-1)
+
+        head_entropies = torch.stack(
+            [d.entropy() for d in multi_dists], dim=-1
+        )
+        entropy = head_entropies.sum(dim=-1)
+
+        value = self.critic_head(hidden)
+
+        return action, log_prob, entropy, value, head_entropies

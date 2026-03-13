@@ -4,6 +4,7 @@ import math
 import ctypes
 import ctypes.wintypes
 import os
+import threading
 
 # Win32 constants
 SW_SHOWNOACTIVATE = 4
@@ -87,8 +88,10 @@ class EmulatorManager:
             self.processes.append(proc)
             print(f"  Instance {i + 1}/{self.num_envs} launched (PID {proc.pid})")
 
-        print("All instances launched. Waiting for windows to appear...")
-        self.arrange_windows()
+        print("All instances launched. Waiting for windows to appear in the background...")
+        arrange_thread = threading.Thread(target=self.arrange_windows)
+        arrange_thread.daemon = True
+        arrange_thread.start()
 
     def arrange_windows(self, timeout=60, poll_interval=2):
         """

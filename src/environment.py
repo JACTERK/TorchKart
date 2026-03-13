@@ -46,10 +46,11 @@ class MK64Env(gym.vector.VectorEnv):
     ACTION_DIMS = [3, 5, 2, 2]
     NUM_ACTION_BYTES = len(ACTION_DIMS)  # 4 bytes sent to Lua
 
-    def __init__(self, num_envs, host, port, frame_skip=4, stack_size=8):
+    def __init__(self, num_envs, host, port, frame_skip=4, stack_size=8, emulator_manager=None):
         # Define how many frames to "stack" for temporal awareness
         self.stack_size = stack_size
         self.frame_skip = frame_skip
+        self.emulator_manager = emulator_manager
 
         # Observation dimensionality (Number of features * the stack size)
         obs_dim = self.NUM_OBS_FEATURES * self.stack_size
@@ -78,8 +79,13 @@ class MK64Env(gym.vector.VectorEnv):
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((host, port))
         self.server_socket.listen(num_envs)
+        self.server_socket.settimeout(300)  # Always use a timeout for accept()
 
         print(f"Server listening on {host}:{port}...")
+        
+        if self.emulator_manager:
+            self.emulator_manager.launch()
+            
         print(f"Waiting for {num_envs} BizHawk clients to connect.")
 
         # Wait for all num_envs clients to connect
@@ -106,6 +112,42 @@ class MK64Env(gym.vector.VectorEnv):
     def _get_stacked_obs(self):
         # Flatten the last two dimensions: (Num_Envs, Stack_Size * Features)
         return self.obs_stacks.reshape(self.num_envs, -1)
+
+    def _reconnect_all(self):
+        """
+        Closes all clients, shuts down and relaunches all emulators, 
+        waits for them to reconnect, and resets all their states.
+        """
+        print(f"\n--- Crash detected! Rebooting ALL emulator instances ---")
+        
+        # 1. Ensure all old sockets are closed
+        for i in range(self.num_envs):
+            try:
+                self.clients[i].close()
+            except:
+                pass
+        self.clients = []
+
+        # 2. Relaunch all emulator processes
+        if self.emulator_manager:
+            self.emulator_manager.shutdown()
+            self.emulator_manager.launch()
+        else:
+            print("WARNING: Cannot relaunch emulators because no EmulatorManager was provided. Stopping.")
+            self.close()
+            raise ConnectionError("Emulator crashed, but no EmulatorManager available to restart.")
+
+        # 3. Wait for new connections
+        print(f"Waiting for {self.num_envs} BizHawk clients to reconnect...")
+        for i in range(self.num_envs):
+            conn, addr = self.server_socket.accept()
+            conn.settimeout(300)
+            self.clients.append(conn)
+            print(f"Client {i + 1}/{self.num_envs} reconnected from {addr}")
+
+        # 4. Reset all environment states
+        for i in range(self.num_envs):
+            self.reset_at(i)
 
     def _parse_and_preprocess(self, state_bytes: bytes, old_wall_values: Tuple[int, int] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -278,10 +320,15 @@ class MK64Env(gym.vector.VectorEnv):
 
             return stacked_obs, {}
 
-        except (socket.timeout, ConnectionAbortedError, ConnectionResetError) as e:
-            print(f"Error resetting client {index}: {e}. Stopping.")
-            self.close()
-            raise e
+        except (socket.timeout, ConnectionAbortedError, ConnectionResetError, BrokenPipeError, ConnectionError) as e:
+            if self.emulator_manager:
+                print(f"Error resetting client {index}: {e}. Initiating automatic FULL recovery...")
+                self._reconnect_all()
+                return self.obs_stacks[index].flatten(), {}
+            else:
+                print(f"Error resetting client {index}: {e}. Stopping.")
+                self.close()
+                raise e
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """
@@ -304,112 +351,146 @@ class MK64Env(gym.vector.VectorEnv):
         trunc_list = []
         info_list = []
 
-        try:
-            # Send action command to all clients
-            for i in range(self.num_envs):
+        clients_to_reconnect = set()
+
+        # Send action command to all clients
+        for i in range(self.num_envs):
+            try:
                 # Send 'S' (Step) command + 1-byte frame_skip + 4-byte multi-action
                 action_bytes = bytes(s_actions[i].astype(np.uint8).tolist())
                 cmd = b'S' + bytes([self.frame_skip]) + action_bytes
                 self.clients[i].sendall(cmd)
+            except Exception as e:
+                print(f"Error sending step to client {i}: {e}")
+                clients_to_reconnect.add(i)
 
-            # Receive new state from all clients
-            for i in range(self.num_envs):
+        # Receive new state from all clients
+        for i in range(self.num_envs):
+            if i in clients_to_reconnect:
+                # Provide dummy data for this step. The environment will be reconnected and reset 
+                # at the end of this function call.
+                obs_list.append(np.zeros(self.NUM_OBS_FEATURES * self.stack_size, dtype=np.float32))
+                rew_list.append(0.0)
+                term_list.append(True)  # Force end of episode for crashing env
+                trunc_list.append(False)
+                info_list.append({"final_info": {"episode": {"r": 0, "l": 0, "final_lap": -99, "avg_speed": 0, "wall_hits": 0, "avg_progress_per_step": 0, "stuck_termination": False}}})
+                continue
+
+            try:
                 state_bytes = self.clients[i].recv(self.STATE_SIZE_BYTES)
-
                 if len(state_bytes) < self.STATE_SIZE_BYTES:
                     raise ConnectionAbortedError(f"Client {i} sent incomplete state on step.")
+            except Exception as e:
+                print(f"Error receiving state from client {i}: {e}")
+                clients_to_reconnect.add(i)
+                # Provide dummy data for this step
+                obs_list.append(np.zeros(self.NUM_OBS_FEATURES * self.stack_size, dtype=np.float32))
+                rew_list.append(0.0)
+                term_list.append(True)  # Force end of episode for crashing env
+                trunc_list.append(False)
+                info_list.append({"final_info": {"episode": {"r": 0, "l": 0, "final_lap": -99, "avg_speed": 0, "wall_hits": 0, "avg_progress_per_step": 0, "stuck_termination": False}}})
+                continue
 
-                # Process state and calculate reward
-                old_state = self.last_state_dicts[i]
-                old_walls = None
-                if old_state:
-                    old_walls = (old_state["raw_wall_1"], old_state["raw_wall_2"])
+            # Process state and calculate reward
+            old_state = self.last_state_dicts[i]
+            old_walls = None
+            if old_state:
+                old_walls = (old_state["raw_wall_1"], old_state["raw_wall_2"])
 
-                new_frame, new_state = self._parse_and_preprocess(state_bytes, old_walls)
+            new_frame, new_state = self._parse_and_preprocess(state_bytes, old_walls)
 
-                # Shift existing frames: [0,1,2,3] -> [1,2,3,0]
-                self.obs_stacks[i] = np.roll(self.obs_stacks[i], shift=-1, axis=0)
+            # Shift existing frames: [0,1,2,3] -> [1,2,3,0]
+            self.obs_stacks[i] = np.roll(self.obs_stacks[i], shift=-1, axis=0)
 
-                # Overwrite the last element with new data
-                self.obs_stacks[i, -1] = new_frame
+            # Overwrite the last element with new data
+            self.obs_stacks[i, -1] = new_frame
 
-                # Create the flat vector for the network
-                stacked_obs = self.obs_stacks[i].flatten()
+            # Create the flat vector for the network
+            stacked_obs = self.obs_stacks[i].flatten()
 
-                reward, terminated, is_finished_race = self._calculate_reward(old_state, new_state)
-                truncated = False # Might add a time limit, for now the stuck check seems to work fine.
+            reward, terminated, is_finished_race = self._calculate_reward(old_state, new_state)
+            truncated = False # Might add a time limit, for now the stuck check seems to work fine.
 
-                # Check if player is stuck
-                if old_state:
-                    # Check progress, accounting for lap crossovers
-                    progress_delta = new_state["progress"] - old_state["progress"]
-                    if new_state["lap"] > old_state["lap"]:
-                        progress_delta += 1000  # Made positive progress
+            # Check if player is stuck
+            if old_state:
+                # Check progress, accounting for lap crossovers
+                progress_delta = new_state["progress"] - old_state["progress"]
+                if new_state["lap"] > old_state["lap"]:
+                    progress_delta += 1000  # Made positive progress
 
-                    if progress_delta < 0.1:  # Not making meaningful progress
-                        self.stuck_counter[i] += 1
-                    else:
-                        self.stuck_counter[i] = 0  # Reset counter, we're moving
+                if progress_delta < 0.1:  # Not making meaningful progress
+                    self.stuck_counter[i] += 1
+                else:
+                    self.stuck_counter[i] = 0  # Reset counter, we're moving
 
-                # Check if stuck for too long (600 steps = 10 seconds at 60fps) @TODO Make this lower
-                if self.stuck_counter[i] > 60:
-                    terminated = True  # End the episode
-                    reward -= 20.0  # Apply a large penalty for being stuck
-                    self.stuck_counter[i] = 0  # Reset counter for next episode
-                    is_finished_race = False
+            # Check if stuck for too long (600 steps = 10 seconds at 60fps) @TODO Make this lower
+            if self.stuck_counter[i] > 60:
+                terminated = True  # End the episode
+                reward -= 20.0  # Apply a large penalty for being stuck
+                self.stuck_counter[i] = 0  # Reset counter for next episode
+                is_finished_race = False
 
-                # Update episode trackers
-                self.last_state_dicts[i] = new_state
-                self.episode_rewards[i] += reward
-                self.episode_lengths[i] += 1
-                self.episode_speed_sum[i] += new_state.get("speed", 0.0)
-                if new_state.get("wall_hit", 0.0) > 0.5:
-                    self.episode_wall_hits[i] += 1
+            # Update episode trackers
+            self.last_state_dicts[i] = new_state
+            self.episode_rewards[i] += reward
+            self.episode_lengths[i] += 1
+            self.episode_speed_sum[i] += new_state.get("speed", 0.0)
+            if new_state.get("wall_hit", 0.0) > 0.5:
+                self.episode_wall_hits[i] += 1
 
-                # Handle "done" state (terminated or truncated)
-                info = {}
-                if terminated or truncated:
-                    ep_len = self.episode_lengths[i]
+            # Handle "done" state (terminated or truncated)
+            info = {}
+            if terminated or truncated:
+                ep_len = self.episode_lengths[i]
 
-                    info["final_info"] = {
-                        "episode": {
-                            "r": self.episode_rewards[i],
-                            "l": ep_len,
-                            "final_lap": new_state.get("lap", -99),
-                            "avg_speed": self.episode_speed_sum[i] / max(ep_len, 1),
-                            "wall_hits": int(self.episode_wall_hits[i]),
-                            "avg_progress_per_step": (new_state.get("progress", 0) - self.episode_progress_start[i]) / max(ep_len, 1),
-                            "stuck_termination": not is_finished_race and terminated,
-                        }
+                info["final_info"] = {
+                    "episode": {
+                        "r": self.episode_rewards[i],
+                        "l": ep_len,
+                        "final_lap": new_state.get("lap", -99),
+                        "avg_speed": self.episode_speed_sum[i] / max(ep_len, 1),
+                        "wall_hits": int(self.episode_wall_hits[i]),
+                        "avg_progress_per_step": (new_state.get("progress", 0) - self.episode_progress_start[i]) / max(ep_len, 1),
+                        "stuck_termination": not is_finished_race and terminated,
                     }
-                    if is_finished_race:
-                        # Account for frame_skip: each step = frame_skip game frames
-                        race_time_seconds = (ep_len * self.frame_skip) / 60.0
-                        info["final_info"]["episode"]["race_time"] = race_time_seconds
+                }
+                if is_finished_race:
+                    # Account for frame_skip: each step = frame_skip game frames
+                    race_time_seconds = (ep_len * self.frame_skip) / 60.0
+                    info["final_info"]["episode"]["race_time"] = race_time_seconds
 
-                    # Auto-reset this environment
-                    stacked_obs, _ = self.reset_at(i)
+                # Auto-reset this environment
+                stacked_obs, _ = self.reset_at(i)
 
-                # Append results
-                obs_list.append(stacked_obs)
-                rew_list.append(reward)
-                term_list.append(terminated)
-                trunc_list.append(truncated)
-                info_list.append(info)
+            # Append results
+            obs_list.append(stacked_obs)
+            rew_list.append(reward)
+            term_list.append(terminated)
+            trunc_list.append(truncated)
+            info_list.append(info)
 
-            # Convert lists to stacked numpy arrays
-            return (
-                np.stack(obs_list),
-                np.array(rew_list, dtype=np.float32),
-                np.array(term_list, dtype=np.bool_),
-                np.array(trunc_list, dtype=np.bool_),
-                info_list,
-            )
+        # Handle reconnects (now doing a FULL system restart)
+        if len(clients_to_reconnect) > 0:
+            if self.emulator_manager:
+                self._reconnect_all()
+                # Overwrite ALL observations in obs_list with the newly restarted fresh states
+                # Make sure we flag them all as terminated so the model knows to reset hidden states (if any)
+                for i in range(self.num_envs):
+                    obs_list[i] = self.obs_stacks[i].flatten()
+                    term_list[i] = True
+            else:
+                print(f"Error with a client and no EmulatorManager. Stopping.")
+                self.close()
+                raise ConnectionError("A client crashed.")
 
-        except (socket.timeout, ConnectionAbortedError, ConnectionResetError) as e:
-            print(f"Error during step: {e}. Stopping.")
-            self.close()
-            raise e
+        # Convert lists to stacked numpy arrays
+        return (
+            np.stack(obs_list),
+            np.array(rew_list, dtype=np.float32),
+            np.array(term_list, dtype=np.bool_),
+            np.array(trunc_list, dtype=np.bool_),
+            info_list,
+        )
 
     def close(self):
         """

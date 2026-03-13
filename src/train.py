@@ -11,6 +11,7 @@ from tqdm import tqdm
 from src.args import parse_args
 from src.environment import MK64Env
 from src.agent import ActorCritic
+from src.emulator_manager import EmulatorManager
 
 
 def main():
@@ -34,9 +35,26 @@ def main():
     if args.torch_deterministic:
         torch.backends.cudnn.deterministic = True
 
+    # --- Setup Emulators ---
+    print("Preparing emulator manager...")
+    emulator_manager = EmulatorManager(
+        num_envs=args.num_envs,
+        bizhawk_exe=args.bizhawk_exe,
+        rom_path=args.rom_path,
+        lua_script=args.lua_script,
+        grid_cols=args.grid_cols,
+        grid_fraction=args.grid_fraction,
+    )
+
     # --- Setup Environment ---
-    # Pause the script and wait for num_envs clients to connect
-    envs = MK64Env(num_envs=args.num_envs, host=args.host, port=args.port, frame_skip=args.frame_skip)
+    # The environment will launch the emulators after it starts listening
+    envs = MK64Env(
+        num_envs=args.num_envs, 
+        host=args.host, 
+        port=args.port, 
+        frame_skip=args.frame_skip,
+        emulator_manager=emulator_manager
+    )
 
     # --- Setup Agent ---
     agent = ActorCritic(envs).to(device)
@@ -285,7 +303,9 @@ def main():
         print(f"\nTraining interrupted: {e}")
     finally:
         # --- Clean Up ---
+        # --- Clean Up ---
         print("Training finished. Closing environment.")
         envs.close()
+        emulator_manager.shutdown()
         writer.close()
         print("Done.")

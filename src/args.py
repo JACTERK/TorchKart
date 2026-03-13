@@ -13,6 +13,16 @@ def parse_args():
                         help="Port to listen on.")
     parser.add_argument("--frame-skip", type=int, default=4,
                         help="Number of frames to repeat each action (reduces network traffic).")
+    parser.add_argument("--rom-path", type=str, default="rom/marioKart.n64",
+                        help="Path to the .n64 ROM file.")
+    parser.add_argument("--bizhawk-exe", type=str, default="./bizhawk/EmuHawk.exe",
+                        help="Path to the BizHawk EmuHawk executable.")
+    parser.add_argument("--lua-script", type=str, default="mk64_interface.lua",
+                        help="Path to the Lua interface script.")
+    parser.add_argument("--grid-cols", type=int, default=5,
+                        help="Number of columns for the emulator window grid layout.")
+    parser.add_argument("--grid-fraction", type=float, default=0.33,
+                        help="Fraction of screen width to use for the emulator grid (0.0-1.0).")
 
     # PPO Hyperparameters
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,

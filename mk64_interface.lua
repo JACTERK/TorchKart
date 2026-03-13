@@ -113,10 +113,10 @@ while true do
         break
     else
         console.log("Failed to connect: " .. tostring(err))
-        console.log("Retrying in 10 seconds...")
+        console.log("Retrying in 2 seconds...")
         client:close()
-        -- Wait for 10 seconds
-        socket.select(nil, nil, 10)
+        -- Wait for 2 seconds
+        socket.select(nil, nil, 2)
     end
 end
 
@@ -131,9 +131,9 @@ while true do
     if not status then
         -- pcall failed, which means the connection was lost
         console.log("Connection error: " .. tostring(command_char_or_err))
-        console.log("Disconnecting.")
+        console.log("Disconnecting. Waiting to reconnect...")
         client:close()
-        break -- Exit the while loop
+        break -- Exit the inner while loop to trigger reconnection
     end
 
     -- If pcall succeeded, command_char_or_err holds the character
@@ -155,7 +155,7 @@ while true do
         if not action_status then
             console.log("Connection error (receiving action): " .. tostring(action_data))
             client:close()
-            break
+            break -- Exit the inner while loop to trigger reconnection
         end
 
         local frame_skip = string.byte(action_data, 1)
@@ -177,13 +177,11 @@ while true do
         -- Close command
         console.log("Close command received. Disconnecting.")
         client:close()
-        break
-
+        break -- Exit the inner while loop
+        
     elseif command_char == nil then
         -- This can happen if the server closes the connection cleanly
         console.log("Server disconnected.")
-        break
+        break -- Exit the inner while loop to trigger reconnection
     end
 end
-
-console.log("Script finished.")

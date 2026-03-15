@@ -29,6 +29,10 @@ def parse_args():
                         help="The learning rate of the optimizer.")
     parser.add_argument("--num-steps", type=int, default=2048,
                         help="Number of steps to run in each environment per policy rollout.")
+    parser.add_argument("--stack-size", type=int, default=1,
+                        help="Number of frames to stack for the observation.")
+    parser.add_argument("--seq-len", type=int, default=8,
+                        help="Length of sequences for LSTM backpropagation through time.")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="The discount factor gamma.")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
@@ -63,4 +67,9 @@ def parse_args():
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    
+    # Validation checks for LSTM integration
+    assert args.batch_size % args.minibatch_size == 0, f"batch_size ({args.batch_size}) must be perfectly divisible by num_minibatches ({args.num_minibatches})."
+    assert args.minibatch_size % args.seq_len == 0, f"minibatch_size ({args.minibatch_size}) must be perfectly divisible by seq_len ({args.seq_len})."
+
     return args

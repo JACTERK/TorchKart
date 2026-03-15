@@ -53,6 +53,7 @@ def main():
         host=args.host, 
         port=args.port, 
         frame_skip=args.frame_skip,
+        stack_size=args.stack_size,
         emulator_manager=emulator_manager
     )
 
@@ -68,6 +69,16 @@ def main():
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+
+    # Storage for LSTM states
+    lstm_states_h = torch.zeros((args.num_steps, args.num_envs, agent.lstm.hidden_size)).to(device)
+    lstm_states_c = torch.zeros((args.num_steps, args.num_envs, agent.lstm.hidden_size)).to(device)
+
+    # Initial LSTM state
+    next_lstm_state = (
+        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
+        torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
+    )
 
     # Counters for per-update aggregate metrics
     head_names = ["throttle", "steering", "drift", "item"]
@@ -120,17 +131,23 @@ def main():
                 obs[step] = next_obs
                 dones[step] = next_done
 
+                # Save lstm state
+                lstm_states_h[step] = next_lstm_state[0].squeeze(0)
+                lstm_states_c[step] = next_lstm_state[1].squeeze(0)
+
                 # Get action from the agent
                 with torch.no_grad():
-                    action, logprob, _, value, _ = agent.get_action_and_value(next_obs)
+                    action, logprob, _, value, _, next_lstm_state = agent.get_action_and_value(
+                        next_obs.unsqueeze(0), next_lstm_state, next_done.unsqueeze(0)
+                    )
                     values[step] = value.flatten()
 
-                actions[step] = action
-                logprobs[step] = logprob
+                actions[step] = action.squeeze(0)
+                logprobs[step] = logprob.squeeze(0)
 
                 # Send action to the environment
                 # `step` returns: next_obs, reward, terminated, truncated, info
-                next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+                next_obs, reward, terminated, truncated, info = envs.step(action.squeeze(0).cpu().numpy())
 
                 # Handle `done`
                 done = np.logical_or(terminated, truncated)
@@ -169,7 +186,7 @@ def main():
 
             # --- Calculate Advantages (GAE) ---
             with torch.no_grad():
-                next_value = agent.get_value(next_obs).reshape(1, -1)
+                next_value = agent.get_value(next_obs.unsqueeze(0), next_lstm_state, next_done.unsqueeze(0)).reshape(1, -1)
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
@@ -185,28 +202,57 @@ def main():
 
             # --- Update Policy (PPO Epochs) ---
 
-            # Flatten the batch
-            b_obs = obs.reshape((-1,) + envs._single_observation_space.shape)
-            b_logprobs = logprobs.reshape(-1)
-            b_actions = actions.reshape((-1, len(envs.ACTION_DIMS)))
-            b_advantages = advantages.reshape(-1)
-            b_returns = returns.reshape(-1)
-            b_values = values.reshape(-1)
+            # Flatten the batch but keep trajectories continuous
+            b_obs = obs.transpose(0, 1).reshape((-1,) + envs._single_observation_space.shape)
+            b_logprobs = logprobs.transpose(0, 1).reshape(-1)
+            b_actions = actions.transpose(0, 1).reshape((-1, len(envs.ACTION_DIMS)))
+            b_advantages = advantages.transpose(0, 1).reshape(-1)
+            b_returns = returns.transpose(0, 1).reshape(-1)
+            b_values = values.transpose(0, 1).reshape(-1)
+            b_dones = dones.transpose(0, 1).reshape(-1)
+
+            b_lstm_states_h = lstm_states_h.transpose(0, 1).reshape((-1, agent.lstm.hidden_size))
+            b_lstm_states_c = lstm_states_c.transpose(0, 1).reshape((-1, agent.lstm.hidden_size))
 
             # Optimizing the policy and value network
             pbar_update = tqdm(range(args.update_epochs), desc="Updating Policy")
+            
+            # Assert that the batch is divisible by minibatch
+            assert args.batch_size % args.minibatch_size == 0
+            # And that minibatch is divisible by seq_len
+            assert args.minibatch_size % args.seq_len == 0
+
             # Display epoch progress on TQDM
             for epoch in pbar_update:
-                # Use a random selection of data to optimize on
-                b_inds = np.random.permutation(args.batch_size)
-                for start in range(0, args.batch_size, args.minibatch_size):
-                    end = start + args.minibatch_size
-                    mb_inds = b_inds[start:end]
+                b_inds = np.arange(args.batch_size).reshape(args.batch_size // args.seq_len, args.seq_len)
+                chunk_inds = np.random.permutation(args.batch_size // args.seq_len)
+                
+                num_chunks_per_mb = args.minibatch_size // args.seq_len
 
-                    # Evaluate the moves made by the 'old' network against the 'new' one
-                    _, newlogprob, entropy, newvalue, head_ents = agent.get_action_and_value(
-                        b_obs[mb_inds], b_actions.long()[mb_inds]
+                for start in range(0, args.batch_size // args.seq_len, num_chunks_per_mb):
+                    end = start + num_chunks_per_mb
+                    mb_chunk_inds = chunk_inds[start:end]
+                    
+                    mb_inds = b_inds[mb_chunk_inds].reshape(-1)
+
+                    # Initial states
+                    first_step_inds = b_inds[mb_chunk_inds][:, 0]
+                    mb_lstm_h = b_lstm_states_h[first_step_inds].unsqueeze(0).contiguous()
+                    mb_lstm_c = b_lstm_states_c[first_step_inds].unsqueeze(0).contiguous()
+                    mb_lstm_states = (mb_lstm_h, mb_lstm_c)
+                    
+                    mb_obs = b_obs[mb_inds].reshape(num_chunks_per_mb, args.seq_len, -1).transpose(0, 1)
+                    mb_actions = b_actions.long()[mb_inds].reshape(num_chunks_per_mb, args.seq_len, -1).transpose(0, 1)
+                    mb_dones = b_dones[mb_inds].reshape(num_chunks_per_mb, args.seq_len).transpose(0, 1)
+
+                    _, newlogprob, entropy, newvalue, head_ents, _ = agent.get_action_and_value(
+                        mb_obs, mb_lstm_states, mb_dones, mb_actions
                     )
+
+                    newlogprob = newlogprob.transpose(0, 1).reshape(-1)
+                    newvalue = newvalue.transpose(0, 1).reshape(-1)
+                    entropy = entropy.transpose(0, 1).reshape(-1)
+                    head_ents = head_ents.transpose(0, 1).reshape(-1, len(envs.ACTION_DIMS))
 
                     # Calculate the ratio between the old and new policy (The proximal part)
                     logratio = newlogprob - b_logprobs[mb_inds]
@@ -282,9 +328,11 @@ def main():
             for h, name in enumerate(head_names):
                 writer.add_scalar(f"entropy/{name}", last_head_entropies[h].item(), global_step)
 
-            # --- LSTM metrics (uncomment when LSTM is implemented) ---
-            # writer.add_scalar("charts/hidden_state_norm", hidden_state.norm().item(), global_step)
-            # writer.add_histogram("charts/episode_length_histogram", episode_lengths_buffer, global_step)
+            # --- LSTM metrics ---
+            writer.add_scalar("charts/hidden_state_norm", next_lstm_state[0].norm().item(), global_step)
+            writer.add_scalar("charts/cell_state_norm", next_lstm_state[1].norm().item(), global_step)
+            writer.add_scalar("charts/hidden_state_std", next_lstm_state[0].std().item(), global_step)
+            writer.add_scalar("charts/cell_state_std", next_lstm_state[1].std().item(), global_step)
 
             if update % args.save_interval == 0:
                 checkpoint_path = f"{run_dir}/checkpoint_update_{update}.pth"

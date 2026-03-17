@@ -31,15 +31,15 @@ def parse_args():
                         help="Number of steps to run in each environment per policy rollout.")
     parser.add_argument("--stack-size", type=int, default=1,
                         help="Number of frames to stack for the observation.")
-    parser.add_argument("--seq-len", type=int, default=8,
+    parser.add_argument("--seq-len", type=int, default=32,
                         help="Length of sequences for LSTM backpropagation through time.")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="The discount factor gamma.")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
                         help="The lambda for the GAE calculation.")
-    parser.add_argument("--num-minibatches", type=int, default=32,
+    parser.add_argument("--num-minibatches", type=int, default=8,
                         help="The number of mini-batches.")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=4,
                         help="The K epochs to update the policy.")
     parser.add_argument("--clip-coef", type=float, default=0.2,
                         help="The surrogate clipping coefficient.")

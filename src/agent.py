@@ -15,47 +15,65 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class ActorCritic(nn.Module):
     """
-    The PPO Actor-Critic network with a multi-head (factored) action space.
-    It shares a common "body" and has multiple "heads":
-    1. The Actor heads (policy), one per action dimension (throttle, steering, drift, item).
-    2. The Critic (value), which estimates the state's value.
+    PPO Actor-Critic with a factored multi-head action space and LSTM for the actor.
+
+    Architecture:
+      Actor path:  obs -> network (MLP 128) -> lstm (128) -> actor_heads
+      Critic path: obs -> critic_mlp (128->64) -> critic_head
+
+    The critic has its own dedicated MLP and bypasses the LSTM entirely.
+    This prevents the actor and critic from fighting over the LSTM representation
+    and gives the value function a clean, uncontested gradient path.
     """
 
     def __init__(self, envs):
         super().__init__()
         obs_shape = envs._single_observation_space.shape
+        obs_dim = int(np.array(obs_shape).prod())
 
         # Get the sizes of each action dimension from MultiDiscrete
         # e.g., [3, 5, 2, 2] for [throttle, steering, drift, item]
         self.action_nvec = envs._single_action_space.nvec
 
-        # The "body" of the network (shared feature extractor)
+        # --- Actor path ---
+
+        # Shared MLP body feeding into the LSTM
         self.network = nn.Sequential(
-            layer_init(nn.Linear(np.array(obs_shape).prod(), 64)),
+            layer_init(nn.Linear(obs_dim, 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(128, 128)),
             nn.Tanh(),
         )
 
-        self.lstm = nn.LSTM(64, 64, batch_first=False)
+        # Single-layer LSTM: 128 -> 128
+        self.lstm = nn.LSTM(128, 128, batch_first=False)
         for name, param in self.lstm.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1.0)
 
-        # The Critic head (value function)
-        self.critic_head = nn.Sequential(
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-
-        # One Actor head per action dimension
+        # Actor heads: one per action dimension (128 -> n_i)
         self.actor_heads = nn.ModuleList([
-            layer_init(nn.Linear(64, n), std=0.01)
+            layer_init(nn.Linear(128, n), std=0.01)
             for n in self.action_nvec
         ])
 
+        # --- Critic path (no LSTM) ---
+
+        # Dedicated MLP that reads directly from raw observations
+        self.critic_mlp = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 128)),
+            nn.Tanh(),
+            layer_init(nn.Linear(128, 64)),
+            nn.Tanh(),
+        )
+
+        # Critic head: 64 -> 1
+        self.critic_head = layer_init(nn.Linear(64, 1), std=1.0)
+
     def get_states(self, x, lstm_state, done):
+        """Runs the actor MLP + LSTM, returning the LSTM output and updated state."""
         hidden = self.network(x)
 
         # LSTM logic
@@ -67,8 +85,8 @@ class ActorCritic(nn.Module):
             h, lstm_state = self.lstm(
                 h.unsqueeze(0),
                 (
-                    (1.0 - d).view(1, -1, 1) * lstm_state[0],
-                    (1.0 - d).view(1, -1, 1) * lstm_state[1],
+                    (1.0 - d).view(1, -1, 1) * lstm_state[0],  # zero h on done
+                    (1.0 - d).view(1, -1, 1) * lstm_state[1],  # zero c on done
                 ),
             )
             new_hidden += [h]
@@ -77,49 +95,48 @@ class ActorCritic(nn.Module):
 
     def get_value(self, x, lstm_state, done):
         """
-        Gets the estimated value of a state.
+        Estimates state value using the dedicated critic MLP (no LSTM).
+        lstm_state and done are accepted for interface compatibility but not used.
         """
-        hidden, _ = self.get_states(x, lstm_state, done)
-        return self.critic_head(hidden)
+        x_flat = x.reshape(-1, x.shape[-1])
+        return self.critic_head(self.critic_mlp(x_flat))
 
     def get_action_and_value(self, x, lstm_state, done, action=None):
         """
-        Gets an action (and its log-probability) and the state value.
-        If an action is provided, it also returns the log-prob and entropy
-        of that action (used during training).
+        Actor uses the MLP + LSTM path.
+        Critic uses the dedicated critic_mlp path (no LSTM).
 
         Returns:
-            action: Tensor of shape (batch, num_heads) — one index per head
-            log_prob: Tensor of shape (batch,) — sum of log-probs across heads
-            entropy: Tensor of shape (batch,) — sum of entropies across heads
-            value: Tensor of shape (batch, 1) — the estimated state value
-            head_entropies: Tensor of shape (batch, num_heads) — entropy per head (for logging)
-            lstm_state: Tuple of updated (hidden_state, cell_state) tensors
+            action:        (batch, num_heads)
+            log_prob:      (batch,)
+            entropy:       (batch,)
+            value:         (batch, 1)
+            head_entropies:(batch, num_heads)
+            lstm_state:    updated (h, c) tuple
         """
+        # Actor path: MLP -> LSTM -> heads
         hidden, lstm_state = self.get_states(x, lstm_state, done)
 
-        # Build a Categorical distribution for each head
         multi_logits = [head(hidden) for head in self.actor_heads]
         multi_dists = [Categorical(logits=logits) for logits in multi_logits]
 
         if action is None:
-            # Sample from each head independently
             action = torch.stack([d.sample() for d in multi_dists], dim=-1)
 
-        # Compute log-prob and entropy per-head, then sum
         log_prob = torch.stack(
-            [d.log_prob(action.reshape(-1, len(self.action_nvec))[:, i]) for i, d in enumerate(multi_dists)], dim=-1
+            [d.log_prob(action.reshape(-1, len(self.action_nvec))[:, i])
+             for i, d in enumerate(multi_dists)], dim=-1
         ).sum(dim=-1)
 
-        head_entropies = torch.stack(
-            [d.entropy() for d in multi_dists], dim=-1
-        )
+        head_entropies = torch.stack([d.entropy() for d in multi_dists], dim=-1)
         entropy = head_entropies.sum(dim=-1)
 
-        if action.ndim == 3: # (seq_len, batch_size, num_heads)
+        if action.ndim == 3:  # (seq_len, batch_size, num_heads)
             log_prob = log_prob.reshape(*action.shape[:2])
             entropy = entropy.reshape(*action.shape[:2])
 
-        value = self.critic_head(hidden)
+        # Critic path: dedicated MLP, bypasses LSTM
+        x_flat = x.reshape(-1, x.shape[-1])
+        value = self.critic_head(self.critic_mlp(x_flat))
 
         return action, log_prob, entropy, value, head_entropies, lstm_state

@@ -1,6 +1,6 @@
 # TorchKart
 
-TorchKart is a modern implementation of a Proximal Policy Optimization Agent learning to play Mario Kart 64. 
+TorchKart is a modern implementation of a Proximal Policy Optimization agent learning to play Mario Kart 64.
 
 ![20 Clients Learning](docs/cover.png)
 
@@ -8,24 +8,26 @@ TorchKart is a modern implementation of a Proximal Policy Optimization Agent lea
 
 ### `mk64_interface.lua`
 
-This is a Lua script written to interface between the BizHawk emulator and the Python server running the PPO. 
-It uses sockets to communicate, and handles reading data from memory, sending it to the server, receiving commands, 
-and executing them. 
+A Lua script that interfaces between the BizHawk emulator and the Python server. It uses TCP sockets to communicate, reading game memory, sending state data to the server, receiving commands, and executing them. It supports multi-discrete actions (`throttle`, `steering`, `drift`, `item`), frame skipping, and a demo recording mode for imitation learning.
 
-In the file you can add/modify the memory values that are read, change the discrete action space, and add/remove 
-commands that the server will send to the client. 
+See [`docs/mk64_interface.md`](docs/mk64_interface.md) for full details on the protocol and memory map.
 
 
-### `torchkart.py/MK64Env`
+### `src/environment.py` / `MK64Env`
 
-This is a custom [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) wrapper for Mario Kart 64. It handles
-most of the logic of the application, including the parsing and pre-processing of the raw memory data, reward function, 
-resetting the environment, and stepping. 
+A custom [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) vectorized environment for Mario Kart 64. It handles parsing and pre-processing raw memory bytes into 14 normalized observation features, computing shaped rewards (progress, speed, wall hits, drift boosts, mushroom usage), frame stacking for temporal context, stuck detection, and automatic crash recovery via `EmulatorManager`.
+
+The action space is `MultiDiscrete([3, 5, 2, 2])` for `[throttle, steering, drift, item]`.
 
 
-### `torchkart.py/ActorCritic`
+### `src/agent.py` / `ActorCriticMLP` & `ActorCriticTransformer`
 
-This is the main PPO implementation, implementing the dual Actor/Critic networks used, as well as getters. 
+Two policy architectures:
+
+- **ActorCriticMLP** (default): A shared-body MLP with separate actor heads per action dimension. Uses frame stacking for temporal context.
+- **ActorCriticTransformer**: A causal transformer that attends over a sequence of observation frames, replacing frame stacking with attention-based temporal reasoning. Enabled with `--use-transformer`.
+
+Both architectures use orthogonal weight initialization and per-head action distributions.
 
 ## Results
 
@@ -39,50 +41,77 @@ To begin, obtain a legal ROM for Mario Kart 64, rename it to `marioKart.n64`, an
 
 The version of BizHawk used for this project is `2.11 (x64)` for Microsoft Windows. The emulator can be downloaded
 [here](https://github.com/TASEmulators/BizHawk/releases/tag/2.11). Note that the Windows binary is the only version
-supported by this program. 
+supported by this program.
 
-- Create a new folder called `bizhawk` that will be used to store the required files for the BizHawk emulator. 
-- Decompress the contents of `BizHawk-2.11-win-x64.zip` into the `bizhawk` folder. 
-- Copy the contents of the `Lua` folder into the `bizhawk/Lua` folder. This will provide the necessary files needed for 
-the socket implementation. 
-- Open the `launch_training.ps1` script, and change the `$RomPath` to the absolute path of your ROM file. 
+- Create a new folder called `bizhawk` that will be used to store the required files for the BizHawk emulator.
+- Decompress the contents of `BizHawk-2.11-win-x64.zip` into the `bizhawk` folder.
+- Copy the contents of the `Lua` folder into the `bizhawk/Lua` folder. Click yes if it asks to replace any files.
 
 ### Create a Save State
 
-Run the `launch_training.ps1` script with no parameters. One EmuHawk emulator will open with the ROM loaded. Progress
-through the menus and start a new time trial on the course of your choosing (the main one tested on was Luigi's 
-Circuit). 
+Run `python launch_emulators.py --num-envs=1` to open one EmuHawk instance with the ROM loaded. Progress
+through the menus and start a new time trial on the course of your choosing (the main one tested on was Luigi's
+Circuit).
 
-When the race begins, go to `File`, `Save State`, and `Save Named State...`. Save the state to the project root folder 
-as `mk64_start.state`. This will be the state that is loaded when the environment tells the client to reset. 
+When the race begins, go to `File`, `Save State`, and `Save Named State...`. Save the state to the project root folder
+as `mk64_start.state`. This will be the state that is loaded when the environment tells the client to reset.
 
-Open the `mk64_interface.lua` script and change the `SAVESTATE_PATH` to the absolute path of your save state file. 
+Open `mk64_interface.lua` and change `SAVESTATE_PATH` to the absolute path of your save state file.
 
 ### (Optional) Set Up TensorBoard
 
-Tensorboard can be used to visualize agent performance over time. 
+TensorBoard can be used to visualize agent performance over time.
 
 - Install TensorBoard with `pip install tensorboard`
 - Run it with `python -m tensorboard.main --logdir=runs`
 
-Tensorboard will be accessible on localhost at `http://localhost:6006`.
+TensorBoard will be accessible on localhost at `http://localhost:6006`.
 
 ## Start Training
 
-To run the app, start the `torchkart.py` script with:
+A single command launches the emulators and starts training:
 
 ```
-python torchkart.py --num_envs=20 --total_timesteps=250000000 save_interval=60
+python main.py --num-envs=20 --total-timesteps=250000000 --save-interval=60
 ```
 
-This will run the script waiting for 20 BizHawk clients, and will run for 250M steps, saving every 60 updates. 
+The training script automatically launches the BizHawk emulators, waits for all clients to connect, then begins training. Emulators are arranged in a grid on the left side of your screen — control the layout with `--grid-cols` (default 5) and `--grid-fraction` (default 0.33).
 
-Next, to start the BizHawk Clients, run `./launch_training.ps1 -NumEnvs=20`. 
-
-Watch the python terminal for the 20 successful connections, and upon the 20 connections the training will begin
-immediately. 
+If you prefer to manage emulators manually (e.g., for distributed setups), you can still use `launch_emulators.py` in a separate terminal and run `main.py` without the auto-launch.
 
 ### Loading a Checkpoint
 
-To run the app from a checkpoint, add the `--load_checkpoint` flag and set it to the absolute path of a `.pth` file you
-want to load. These files are automatically saved in the `runs` folder. 
+To resume from a checkpoint, add the `--load-checkpoint` flag:
+
+```
+python main.py --num-envs=20 --load-checkpoint=runs/<experiment>/checkpoint_update_N.pth
+```
+
+This restores agent weights, optimizer state, the update counter, and global step.
+
+## Imitation Learning Pipeline
+
+You can pre-train the policy on human demonstrations before running PPO:
+
+```bash
+# 1. Record a demo (drive the kart yourself)
+python -m src.record_demo --output demos/my_demo.npz
+
+# 2. Pre-train with behavioral cloning
+python -m src.pretrain --demo-files demos/my_demo.npz --output demos/bc_pretrained.pth
+
+# 3. Fine-tune with PPO
+python main.py --load-checkpoint demos/bc_pretrained.pth
+```
+
+The sequence length used for pre-training must match that of the one you choose to use in the training run. 
+
+## Architecture Options
+
+To use the Transformer policy instead of the default MLP:
+
+```
+python main.py --use-transformer --seq-length=1024
+```
+
+See [`docs/hyperparameters.md`](docs/hyperparameters.md) for the full list of configurable parameters.

@@ -1,6 +1,8 @@
 # TorchKart
 
-TorchKart is a modern implementation of a Proximal Policy Optimization agent learning to play Mario Kart 64.
+TorchKart is a modern Proximal Policy Optimization (PPO) agent for Mario Kart 64, featuring a modular training pipeline, a causal Transformer policy for long-range temporal reasoning, and an imitation-learning pre-training stage. The codebase has been reorganized from a single monolithic script into a clean `src/` package for easier experimentation.
+
+> **Latest Advancement:** Causal Transformer policy architecture replacing frame stacking with attention-based temporal reasoning, along with a full imitation-learning pipeline and automatic emulator management.
 
 ![20 Clients Learning](docs/cover.png)
 
@@ -15,7 +17,7 @@ See [`docs/mk64_interface.md`](docs/mk64_interface.md) for full details on the p
 
 ### `src/environment.py` / `MK64Env`
 
-A custom [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) vectorized environment for Mario Kart 64. It handles parsing and pre-processing raw memory bytes into 14 normalized observation features, computing shaped rewards (progress, speed, wall hits, drift boosts, mushroom usage), frame stacking for temporal context, stuck detection, and automatic crash recovery via `EmulatorManager`.
+A custom [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) vectorized environment for Mario Kart 64. It handles parsing and pre-processing raw memory bytes into 14 normalized observation features, computing shaped rewards (progress, speed, wall hits, drift boosts, mushroom usage), frame skipping to reduce network traffic, frame stacking for temporal context, stuck detection, and automatic crash recovery via `EmulatorManager`.
 
 The action space is `MultiDiscrete([3, 5, 2, 2])` for `[throttle, steering, drift, item]`.
 
@@ -97,14 +99,16 @@ You can pre-train the policy on human demonstrations before running PPO:
 # 1. Record a demo (drive the kart yourself)
 python -m src.record_demo --output demos/my_demo.npz
 
-# 2. Pre-train with behavioral cloning
-python -m src.pretrain --demo-files demos/my_demo.npz --output demos/bc_pretrained.pth
+# 2. Pre-train with behavioral cloning (use --use-transformer if fine-tuning a Transformer)
+python -m src.pretrain --demo-files demos/my_demo.npz \
+    --output demos/bc_pretrained.pth \
+    --seq-length=8            # match your training config
 
 # 3. Fine-tune with PPO
 python main.py --load-checkpoint demos/bc_pretrained.pth
 ```
 
-The sequence length used for pre-training must match that of the one you choose to use in the training run. 
+The sequence length and architecture used for pre-training must match those you choose for the PPO training run. Use `--use-transformer` and the same `--seq-length` in `src.pretrain` when pre-training for the Transformer policy. 
 
 ## Architecture Options
 

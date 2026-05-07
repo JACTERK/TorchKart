@@ -1,0 +1,4 @@
+*.md
+!docs/
+!LICENSE.md
+!README.md
